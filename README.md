@@ -14,6 +14,9 @@ MCP Gateway serves as a reverse proxy for MCP-compliant AI tool servers. It rout
 - Session affinity for stateful operations
 
 ## Architecture
+
+![MCP Gateway Architecture](assets/architecture_diagram.png)
+
 ```text
 Client Request → MCP Gateway → Circuit Breaker → Backend Server
 ↓
@@ -91,6 +94,10 @@ The gateway exposes the following Prometheus metrics:
 | gateway_server_health | Backend server health status (0/1) |
 | gateway_circuit_breaker_state | Circuit state (0=closed, 1=open, 2=half_open) |
 | gateway_sessions_active | Number of active client sessions |
+
+### Grafana Dashboard
+
+![Grafana Dashboard Mockup](assets/grafana_dashboard.png)
 
 ### Query Examples
 
