@@ -67,7 +67,7 @@ docker-compose up -d
 ```
 Access Grafana dashboard at http://localhost:3000 (admin/admin)
 
-![Grafana Dashboard](assets/grafana_dashboard.png)
+![Grafana Dashboard](assets/grafana_dashboard1.png)
 
 ## Configuration
 
