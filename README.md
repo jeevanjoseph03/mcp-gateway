@@ -170,6 +170,7 @@ docker-compose up -d
 MIT
 
 ## Author
-Your Name
-GitHub: yourusername
-LinkedIn: yourprofile
+JEEVAN GEORGE JOSEPH
+
+- **GitHub**: [jeevanjoseph03](https://github.com/jeevanjoseph03)
+- **LinkedIn**: [jeevanjoseph03](https://www.linkedin.com/in/jeevanjoseph03/)
