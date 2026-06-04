@@ -166,8 +166,6 @@ docker-compose up -d
 - Phase 3: Circuit breaker implementation - Complete
 - Phase 4: Metrics and observability - Complete
 
-## License
-MIT
 
 ## Author
 JEEVAN GEORGE JOSEPH
