@@ -1,0 +1,143 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/jeevanjoseph03/mcp-gateway/internal/config"
+	"github.com/jeevanjoseph03/mcp-gateway/internal/metrics"
+	"github.com/jeevanjoseph03/mcp-gateway/internal/registry"
+	"github.com/jeevanjoseph03/mcp-gateway/internal/router"
+	"github.com/jeevanjoseph03/mcp-gateway/internal/server"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+func main() {
+	configPath := flag.String("config", "configs/config.yaml", "Path to configuration file")
+	flag.Parse()
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Printf("Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	logger := initLogger(cfg)
+	defer logger.Sync()
+
+	logger.Info("MCP Gateway v3 starting", 
+		zap.String("version", "3.0.0"),
+		zap.Int("port", cfg.Gateway.Port))
+
+	// Create metrics collector
+	metricsCollector := metrics.NewMetricsCollector(logger)
+	logger.Info("metrics collector initialized")
+
+	reg := registry.NewRegistry()
+	for _, serverCfg := range cfg.Servers {
+		logger.Info("registering server", zap.String("id", serverCfg.ID))
+		reg.AddServer(&serverCfg)
+		metricsCollector.UpdateServerHealth(serverCfg.ID, true)
+	}
+
+	sessionManager := registry.NewSessionManager(30 * time.Minute)
+
+	healthChecker := registry.NewHealthChecker(reg, logger)
+	healthChecker.Start()
+	defer healthChecker.Stop()
+
+	// Start session stats updater
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			stats := sessionManager.GetStats()
+			if count, ok := stats["total_sessions"].(int); ok {
+				metricsCollector.UpdateSessions(count)
+			}
+		}
+	}()
+
+	// Start server health updater
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			for _, server := range reg.GetAllServers() {
+				metricsCollector.UpdateServerHealth(server.Config.ID, server.Healthy)
+			}
+		}
+	}()
+
+	// Pass metrics to router
+	rtr := router.NewRouter(reg, sessionManager, logger, metricsCollector)
+
+	httpServer := server.NewHTTPServer(cfg, rtr, logger, metricsCollector)
+	if err := httpServer.Start(); err != nil {
+		logger.Fatal("Failed to start HTTP server", zap.Error(err))
+	}
+
+	waitForShutdown()
+
+	logger.Info("shutting down gracefully")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := httpServer.Stop(shutdownCtx); err != nil {
+		logger.Error("Error during shutdown", zap.Error(err))
+	}
+}
+
+// initLogger creates a configured logger
+func initLogger(cfg *config.Config) *zap.Logger {
+	var zapCfg zap.Config
+
+	if cfg.Logging.Format == "json" {
+		zapCfg = zap.NewProductionConfig()
+	} else {
+		zapCfg = zap.NewDevelopmentConfig()
+		zapCfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	}
+
+	// Set log level
+	switch cfg.Logging.Level {
+	case "debug":
+		zapCfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+	case "info":
+		zapCfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
+	case "warn":
+		zapCfg.Level = zap.NewAtomicLevelAt(zap.WarnLevel)
+	case "error":
+		zapCfg.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
+	default:
+		zapCfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
+	}
+
+	// Set output
+	if cfg.Logging.Output != "stdout" && cfg.Logging.Output != "stderr" {
+		// File output would go here, but for simplicity we'll use stdout
+		zapCfg.OutputPaths = []string{"stdout"}
+	} else {
+		zapCfg.OutputPaths = []string{cfg.Logging.Output}
+	}
+
+	logger, err := zapCfg.Build()
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create logger: %v", err))
+	}
+
+	return logger
+}
+
+// waitForShutdown blocks until a shutdown signal is received
+func waitForShutdown() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+}

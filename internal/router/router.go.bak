@@ -1,0 +1,311 @@
+package router
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/jeevanjoseph03/mcp-gateway/internal/circuitbreaker"
+	"github.com/jeevanjoseph03/mcp-gateway/internal/metrics"
+	"github.com/jeevanjoseph03/mcp-gateway/internal/registry"
+	"github.com/jeevanjoseph03/mcp-gateway/internal/types"
+	"go.uber.org/zap"
+)
+
+type Router struct {
+	registry        *registry.Registry
+	sessionManager  *registry.SessionManager
+	logger          *zap.Logger
+	client          *http.Client
+	circuitBreakers map[string]*circuitbreaker.CircuitBreaker
+	cbMu            sync.RWMutex
+	metrics         *metrics.MetricsCollector
+}
+
+func NewRouter(reg *registry.Registry, sessionManager *registry.SessionManager, logger *zap.Logger, metrics *metrics.MetricsCollector) *Router {
+	return &Router{
+		registry:       reg,
+		sessionManager: sessionManager,
+		logger:         logger,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		circuitBreakers: make(map[string]*circuitbreaker.CircuitBreaker),
+		metrics:         metrics,
+	}
+}
+
+func (r *Router) getCircuitBreaker(serverID string) *circuitbreaker.CircuitBreaker {
+	r.cbMu.RLock()
+	cb, exists := r.circuitBreakers[serverID]
+	r.cbMu.RUnlock()
+
+	if exists {
+		return cb
+	}
+
+	r.cbMu.Lock()
+	defer r.cbMu.Unlock()
+
+	if cb, exists := r.circuitBreakers[serverID]; exists {
+		return cb
+	}
+
+	cb = circuitbreaker.NewCircuitBreaker(serverID)
+	r.circuitBreakers[serverID] = cb
+	return cb
+}
+
+func (r *Router) Route(ctx context.Context, rawRequest []byte) ([]byte, error) {
+	var baseReq struct {
+		Method string      `json:"method"`
+		ID     interface{} `json:"id"`
+	}
+
+	if err := json.Unmarshal(rawRequest, &baseReq); err != nil {
+		return r.errorResponse(nil, types.ParseError, "Invalid JSON", err.Error())
+	}
+
+	sessionID := "default-session"
+
+	switch baseReq.Method {
+	case "initialize":
+		return r.handleInitialize(ctx, rawRequest, baseReq.ID, sessionID)
+	case "tools/list":
+		return r.handleToolList(ctx, rawRequest, baseReq.ID, sessionID)
+	case "tools/call":
+		return r.handleToolCall(ctx, rawRequest, baseReq.ID, sessionID)
+	default:
+		return r.errorResponse(baseReq.ID, types.MethodNotFound,
+			fmt.Sprintf("Method not found: %s", baseReq.Method), nil)
+	}
+}
+
+func (r *Router) handleInitialize(ctx context.Context, rawRequest []byte, id interface{}, sessionID string) ([]byte, error) {
+	servers := r.registry.GetAllServers()
+	var preferredServer *registry.BackendServer
+	for _, server := range servers {
+		if server.Healthy {
+			preferredServer = server
+			break
+		}
+	}
+
+	if preferredServer == nil {
+		return r.errorResponse(id, types.InternalError, "No healthy servers available", nil)
+	}
+
+	r.sessionManager.GetOrCreate(sessionID, preferredServer.Config.ID)
+
+	response := types.InitializeResponse{
+		ProtocolVersion: "2025-03-26",
+		Capabilities: types.ServerCapabilities{
+			Tools: &types.ToolsCapability{ListChanged: true},
+		},
+		ServerInfo: types.ServerInfo{
+			Name:    "MCP Gateway v2",
+			Version: "2.0.0",
+		},
+	}
+
+	return r.successResponse(id, response)
+}
+
+func (r *Router) handleToolList(ctx context.Context, rawRequest []byte, id interface{}, sessionID string) ([]byte, error) {
+	servers := r.registry.GetAllServers()
+	toolMap := make(map[string]types.Tool)
+
+	for _, server := range servers {
+		if !server.Healthy {
+			continue
+		}
+
+		tools, err := r.getToolsFromServer(ctx, server)
+		if err != nil {
+			r.logger.Warn("failed to get tools", zap.String("server", server.Config.ID), zap.Error(err))
+			continue
+		}
+
+		for _, tool := range tools {
+			toolMap[tool.Name] = tool
+		}
+
+		var toolNames []string
+		for _, tool := range tools {
+			toolNames = append(toolNames, tool.Name)
+		}
+		r.registry.SetServerTools(server.Config.ID, toolNames)
+	}
+
+	allTools := make([]types.Tool, 0, len(toolMap))
+	for _, tool := range toolMap {
+		allTools = append(allTools, tool)
+	}
+
+	response := types.ToolListResponse{Tools: allTools}
+	return r.successResponse(id, response)
+}
+
+func (r *Router) handleToolCall(ctx context.Context, rawRequest []byte, id interface{}, sessionID string) ([]byte, error) {
+	var req types.JSONRPCRequest
+	if err := json.Unmarshal(rawRequest, &req); err != nil {
+		return r.errorResponse(id, types.ParseError, "Invalid request", err.Error())
+	}
+
+	var toolCall types.ToolCallRequest
+	paramsBytes, _ := json.Marshal(req.Params)
+	json.Unmarshal(paramsBytes, &toolCall)
+
+	var targetServer *registry.BackendServer
+
+	if session, exists := r.sessionManager.Get(sessionID); exists {
+		if server, err := r.registry.GetServer(session.ServerID); err == nil && server.Healthy {
+			targetServer = server
+		}
+	}
+
+	if targetServer == nil {
+		server, err := r.registry.GetHealthyServer(toolCall.Name)
+		if err != nil {
+			return r.errorResponse(id, types.InternalError, err.Error(), nil)
+		}
+		targetServer = server
+		r.sessionManager.UpdateServer(sessionID, targetServer.Config.ID)
+	}
+
+	result, err := r.forwardToolCallWithCircuitBreaker(ctx, targetServer, &toolCall)
+	if err != nil {
+		if err == circuitbreaker.ErrCircuitOpen {
+			return r.errorResponse(id, types.InternalError, "Service temporarily unavailable (circuit open)", nil)
+		}
+		return r.errorResponse(id, types.InternalError, err.Error(), nil)
+	}
+
+	return r.successResponse(id, result)
+}
+
+func (r *Router) forwardToolCallWithCircuitBreaker(ctx context.Context, server *registry.BackendServer, toolCall *types.ToolCallRequest) (*types.ToolCallResponse, error) {
+	cb := r.getCircuitBreaker(server.Config.ID)
+	
+	// Record circuit breaker state
+	r.metrics.RecordCircuitBreakerState(server.Config.ID, cb.GetStateCode())
+	
+	var result *types.ToolCallResponse
+	startTime := time.Now()
+	
+	err := cb.Call(func() error {
+		res, err := r.forwardToolCall(ctx, server, toolCall)
+		if err != nil {
+			r.metrics.RecordCircuitBreakerFailure(server.Config.ID)
+			return err
+		}
+		result = res
+		return nil
+	})
+	
+	// Record request metrics
+	status := "success"
+	if err != nil {
+		status = "failure"
+	}
+	r.metrics.RecordRequest("tools/call", server.Config.ID, status, time.Since(startTime))
+	
+	// Update circuit state after call
+	r.metrics.RecordCircuitBreakerState(server.Config.ID, cb.GetStateCode())
+	
+	return result, err
+}
+
+func (r *Router) forwardToolCall(ctx context.Context, server *registry.BackendServer, toolCall *types.ToolCallRequest) (*types.ToolCallResponse, error) {
+	request := types.JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      "gateway-tool-call",
+		Method:  "tools/call",
+		Params:  toolCall,
+	}
+
+	requestBody, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, server.Config.Timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, "POST", server.Config.URL, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var rpcResponse types.JSONRPCResponse
+	if err := json.Unmarshal(body, &rpcResponse); err != nil {
+		return nil, err
+	}
+
+	resultBytes, err := json.Marshal(rpcResponse.Result)
+	if err != nil {
+		return nil, err
+	}
+
+	var toolResult types.ToolCallResponse
+	if err := json.Unmarshal(resultBytes, &toolResult); err != nil {
+		return nil, err
+	}
+
+	return &toolResult, nil
+}
+
+func (r *Router) getToolsFromServer(ctx context.Context, server *registry.BackendServer) ([]types.Tool, error) {
+	request := types.JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      "gateway-tools-list",
+		Method:  "tools/list",
+		Params:  types.ToolListRequest{},
+	}
+
+	requestBody, _ := json.Marshal(request)
+	req, _ := http.NewRequestWithContext(ctx, "POST", server.Config.URL, bytes.NewReader(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	var rpcResponse types.JSONRPCResponse
+	json.Unmarshal(body, &rpcResponse)
+
+	resultBytes, _ := json.Marshal(rpcResponse.Result)
+	var toolList types.ToolListResponse
+	json.Unmarshal(resultBytes, &toolList)
+
+	return toolList.Tools, nil
+}
+
+func (r *Router) successResponse(id interface{}, result interface{}) ([]byte, error) {
+	return json.Marshal(types.NewSuccessResponse(id, result))
+}
+
+func (r *Router) errorResponse(id interface{}, code int, message string, data interface{}) ([]byte, error) {
+	return json.Marshal(types.NewErrorResponse(id, code, message, data))
+}

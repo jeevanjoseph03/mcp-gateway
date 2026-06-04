@@ -1,0 +1,152 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/jeevanjoseph03/mcp-gateway/internal/config"
+	"github.com/jeevanjoseph03/mcp-gateway/internal/metrics"
+	"github.com/jeevanjoseph03/mcp-gateway/internal/router"
+	"github.com/jeevanjoseph03/mcp-gateway/internal/types"
+	"go.uber.org/zap"
+)
+
+// HTTPServer handles HTTP requests to the MCP gateway
+// This is the public face of your gateway - clients connect here
+type HTTPServer struct {
+	config  *config.Config
+	router  *router.Router
+	logger  *zap.Logger
+	server  *http.Server
+	metrics *metrics.MetricsCollector
+}
+
+// NewHTTPServer creates a new HTTP server
+func NewHTTPServer(cfg *config.Config, router *router.Router, logger *zap.Logger, metrics *metrics.MetricsCollector) *HTTPServer {
+	return &HTTPServer{
+		config:  cfg,
+		router:  router,
+		logger:  logger,
+		metrics: metrics,
+	}
+}
+
+// Start begins listening for HTTP requests
+func (s *HTTPServer) Start() error {
+	addr := fmt.Sprintf("%s:%d", s.config.Gateway.Host, s.config.Gateway.Port)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", s.handleMCP)
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/circuit-breakers", s.handleCircuitBreakers)
+	mux.Handle("/metrics", s.metrics.Handler())
+	mux.HandleFunc("/", s.handleNotFound)
+
+	s.server = &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  s.config.Gateway.ReadTimeout,
+		WriteTimeout: s.config.Gateway.WriteTimeout,
+		IdleTimeout:  s.config.Gateway.IdleTimeout,
+	}
+
+	s.logger.Info("HTTP server starting", zap.String("address", addr))
+
+	go func() {
+		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			s.logger.Fatal("HTTP server failed", zap.Error(err))
+		}
+	}()
+
+	return nil
+}
+
+// Stop gracefully shuts down the HTTP server
+func (s *HTTPServer) Stop(ctx context.Context) error {
+	s.logger.Info("shutting down HTTP server")
+	return s.server.Shutdown(ctx)
+}
+
+// handleMCP is the main entry point for all MCP requests
+func (s *HTTPServer) handleMCP(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+
+	// Track in-flight requests
+	s.metrics.IncrementInFlight()
+	defer s.metrics.DecrementInFlight()
+
+	// Only accept POST requests (standard for MCP)
+	if r.Method != http.MethodPost {
+		s.writeError(w, nil, types.InvalidRequest, "Only POST method allowed", nil)
+		return
+	}
+
+	// Read the request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.logger.Error("failed to read request body", zap.Error(err))
+		s.writeError(w, nil, types.ParseError, "Failed to read request", nil)
+		return
+	}
+	defer r.Body.Close()
+
+	s.logger.Debug("received request",
+		zap.String("method", r.Method),
+		zap.String("path", r.URL.Path),
+		zap.ByteString("body", body),
+	)
+
+	// Route the request to the appropriate handler
+	response, err := s.router.Route(r.Context(), body)
+	if err != nil {
+		s.logger.Error("routing failed", zap.Error(err))
+		s.writeError(w, nil, types.InternalError, "Internal server error", nil)
+		return
+	}
+
+	// Write the response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(response)
+
+	s.logger.Info("request completed",
+		zap.Duration("duration", time.Since(startTime)),
+		zap.Int("response_size", len(response)),
+	)
+}
+
+// handleHealth provides a simple health endpoint for the gateway itself
+func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "healthy",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// handleNotFound handles all other routes
+func (s *HTTPServer) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	s.writeError(w, nil, types.InvalidRequest, fmt.Sprintf("Endpoint not found: %s", r.URL.Path), nil)
+}
+
+// writeError writes a JSON-RPC error response
+func (s *HTTPServer) writeError(w http.ResponseWriter, id interface{}, code int, message string, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK) // JSON-RPC always returns 200 even for errors
+
+	response := types.NewErrorResponse(id, code, message, data)
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleCircuitBreakers returns stats for all circuit breakers
+func (s *HTTPServer) handleCircuitBreakers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "circuit breaker stats endpoint - coming in Phase 3",
+	})
+}

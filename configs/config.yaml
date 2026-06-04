@@ -1,0 +1,16 @@
+gateway:
+  host: "0.0.0.0"
+  port: 8080
+
+servers:
+  - id: "test-server-1"
+    name: "Test Server 1"
+    url: "http://localhost:8081/mcp"
+    transport: "http"
+    timeout: 30s
+    retry_count: 3
+
+logging:
+  level: "debug"
+  format: "text"
+  output: "stdout"
